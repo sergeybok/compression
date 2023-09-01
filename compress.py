@@ -21,19 +21,18 @@ class ArithmeticCoding:
             self.encode_cumprobints = []
             self.decode_cumprobints = []
             self._window = 0
-    def binsearch(self, nums) -> int:
+    
+    def binsearch(self, nums):
         target = self.get_buf_val()
-        left, right = 0, len(nums) - 1
+        left, right = 0, len(nums)
         while left < right:
-            mid = left + (right - left) // 2
-            if nums[mid] == target:
-                return mid
-            elif nums[mid] < target:
+            mid = (left + right) // 2
+            if nums[mid] <= target:
                 left = mid + 1
             else:
-                right = mid - 1
+                right = mid
         return right
-    def binsearch(self, nums) -> int:
+    def _binsearch(self, nums:list) -> int:
         target = self.get_buf_val()
         floor_int = self.floor
         for i in range(0, len(nums)):
