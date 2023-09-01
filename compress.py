@@ -24,7 +24,7 @@ class ArithmeticCoding:
     def binsearch(self, nums) -> int:
         target = self.get_buf_val()
         left, right = 0, len(nums) - 1
-        while left <= right:
+        while left < right:
             mid = left + (right - left) // 2
             if nums[mid] == target:
                 return mid
@@ -33,6 +33,15 @@ class ArithmeticCoding:
             else:
                 right = mid - 1
         return right
+    def binsearch(self, nums) -> int:
+        target = self.get_buf_val()
+        floor_int = self.floor
+        for i in range(0, len(nums)):
+            if floor_int <= target < nums[i]:
+                return i 
+            floor_int = nums[i]
+        return len(nums) - 1
+
     def get_cum_prob_int(self, probs, window:int=2**32, offset:int=0):
         probs = probs.to(torch.float64)
         cumint = 0
@@ -76,10 +85,12 @@ class ArithmeticCoding:
             self.encode_ceils.append(self.ceiling)
             self.encode_cumprobints.append(cumprob_int)
 
-    def cache_buffer(self, path='buf.npy'):
-        torch.save(self.buf, path)
+    def cache_buffer(self, path='compressed.bin'):
+        np.array(self.buf, dtype=self.buf[0].dtype).tofile(path)
+
     def load_buffer(self, path='buf.npy'):
-        self.buf = torch.load(path)
+        self.buf = np.memmap(path, dtype=np.uint32, mode='r')
+
     def clear_buffer(self):
         self.buf = [np.zeros((1,), dtype=np.uint32)]
         self.floor = 0
@@ -88,7 +99,7 @@ class ArithmeticCoding:
     def get_buf_val(self):
         return self.buf[0]
     def pop_buf_val(self):
-        return self.buf.pop(0)
+        self.buf = self.buf[1:]
 
     def decode_token(self, probs=None):
         if probs is None:
@@ -104,7 +115,7 @@ class ArithmeticCoding:
             cumprobs_int = self.get_cum_prob_int(probs.type(torch.float64), window=window, offset=self.floor)
             idx = self.binsearch(cumprobs_int)
             self.ceiling = cumprobs_int[idx]
-            if idx > 1:
+            if idx > 0:
                 self.floor = cumprobs_int[idx-1]
             if self.debug:
                 self.decode_ceils.append(self.ceiling)

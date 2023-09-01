@@ -45,20 +45,20 @@ class TrainParams(BaseModel):
     lr:float=0.0004
     beta1:float=0.5
     beta2:float=0.999 
-    weight_decay:float=1e-2
+    weight_decay:float=1e-5
     grad_clip:float=2.0
     warmup:int=100
     use_scheduler:bool=True
     cycle_steps:int=-1
     gradient_accumulation_steps:int=1
-    window_size:int=200
-    overlap_size:int=100
+    window_size:int=100
+    overlap_size:int=0
     vocab_size:int = 2000
-    model_name:str='gpt2small' # ['lstm', 'gpt2small' 'gpt2tiny', 'gpt2']
+    model_name:str='rnnbig' # [ 'rnnbig', 'lstmbig','lstmmedium', 'gpt2small' 'gpt2tiny', 'gpt2']
     model_params: BaseModel = None
     device_type:str = 'cpu'
     dataset_name:str = 'shakespeare' # ['tokyo-article', 'wiki9', 'shakespeare']
-    seed:int=1580
+    seed:int=1583
 
 
 
@@ -75,6 +75,18 @@ def init_model(params:TrainParams) -> LMCompressorBase:
     if params.model_name == 'gpt2small':
         from model import GPTSmall
         model = GPTSmall(params)
+        return model
+    elif params.model_name == 'lstmbig':
+        from model import LSTMBig
+        model = LSTMBig(params)
+        return model
+    elif params.model_name == 'lstmmedium':
+        from model import LSTMMedium
+        model = LSTMMedium(params)
+        return model
+    elif params.model_name == 'rnnbig':
+        from model import RNNBig
+        model = RNNBig(params)
         return model
     elif params.model_name == 'lstm':
         raise NotImplementedError('TODO')
@@ -107,12 +119,12 @@ def train_compress(params:TrainParams):
     while it < len(dataset):
         X,Y = dataset[it]
         with ctx:
+            optimizer.zero_grad()
             loss, masked_loss = model.compress_step(X.unsqueeze(0),Y.unsqueeze(0))
             loss.backward()
             if params.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), params.grad_clip)
             optimizer.step()
-            optimizer.zero_grad()
             if scheduler:
                 scheduler.step()
             total_loss += masked_loss.item() * model.get_step_size()
@@ -120,7 +132,7 @@ def train_compress(params:TrainParams):
             exp_avg_loss = masked_loss.item()
         else:
             exp_avg_loss = (exp_avg_loss + masked_loss.item()) / 2
-        if global_step % 200 == 0:
+        if global_step % 50 == 0:
             writer.add_scalar('loss_smoothed', exp_avg_loss, global_step=it)
             pbar.set_description(f'loss={round(exp_avg_loss, 3)}')
         global_step += 1
@@ -131,8 +143,7 @@ def train_compress(params:TrainParams):
     os.makedirs(exp_path, exist_ok=True)
     with open(f'{exp_path}/compress_meta.json', 'w') as f:
         json.dump({'params': params.dict(), 'string_begin': dataset[0][0].detach().cpu().numpy().tolist()}, f)
-    bufint = np.array(model.compressor.buf, dtype=model.compressor.buf[0].dtype)
-    bufint.tofile(f'{exp_path}/compressed_string.bin')
+    model.compressor.cache_buffer(f'{exp_path}/compressed_string.bin')
 
 
 
