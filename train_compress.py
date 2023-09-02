@@ -12,7 +12,9 @@ from typing import Optional
 import os 
 from contextlib import nullcontext
 
-from compress import ArithmeticCoding
+# from compress import ArithmeticCoding
+from arithmetic_coding import ArithmeticCoding
+
 from data_utils import OrderedTextDataset
 from model import LMCompressorBase
 
@@ -58,7 +60,7 @@ class TrainParams(BaseModel):
     model_params: BaseModel = None
     device_type:str = 'cpu'
     dataset_name:str = 'shakespeare' # ['tokyo-article', 'wiki9', 'shakespeare']
-    seed:int=1583
+    seed:int=1584
 
 
 
