@@ -1,6 +1,5 @@
 /**
  * BASED on https://github.com/fab-jul/torchac
- * Based on https://marknelson.us/posts/2014/10/19/data-compression-with-arithmetic-coding.html
  */
 
 #include <torch/extension.h>
@@ -22,8 +21,6 @@
 
 using cdf_t = uint16_t;
 
-// const bool VERBOSE = true;
-#define VERBOSE;
 
 /** Encapsulates a pointer to a CDF tensor */
 struct cdf_ptr {
@@ -41,6 +38,31 @@ void printStringInHex(const std::string& data) {
     }
     std::cout << std::endl  << std::dec;
 }
+
+bool saveStringAsBytes(const std::string& data, const std::string& filename) {
+    std::ofstream outFile(filename, std::ios::out | std::ios::binary);
+    if (!outFile) {
+        return false;  // Failed to open the file
+    }
+
+    outFile.write(data.c_str(), data.size());
+    outFile.close();
+
+    return true;  // Successfully written
+}
+std::string loadStringFromBytes(const std::string& filename) {
+    std::ifstream inFile(filename, std::ios::in | std::ios::binary);
+    if (!inFile) {
+        return "";  // Failed to open the file
+    }
+
+    std::ostringstream ss;
+    ss << inFile.rdbuf();
+    inFile.close();
+
+    return ss.str();
+}
+
 /** Class to save output bit by bit to a byte string */
 class OutCacheString {
 private:
@@ -122,14 +144,10 @@ struct CodecState {
     uint64_t pending_bits_encode;
     uint64_t pending_bits_decode;
     
-    uint8_t cache_encoder=0;
-    uint8_t count_encoder=0;
-    uint8_t cache_decoder=0;
     uint32_t value=0;
     OutCacheString out_cache;
     InCacheString in_cache;
 
-    // std::string out;
     CodecState() : low_encode(0), high_encode(0xFFFFFFFFU), low_decode(0), high_decode(0xFFFFFFFFU), pending_bits_encode(0), pending_bits_decode(0), value(0) {}
 };
 
@@ -263,8 +281,6 @@ py::bytes encode(
         out_cache.flush();
         state.in_cache.set(out_cache.out);
     }
-    state.cache_encoder = out_cache.cache;
-    state.count_encoder = out_cache.count;
     state.low_encode = low;
     state.high_encode = high;
     state.pending_bits_encode = pending_bits;
@@ -356,11 +372,7 @@ torch::Tensor decode(
         auto sym_i = binsearch(cdf, count, (cdf_t)max_symbol, offset);
 
         out_[i] = (int16_t)sym_i;
-
-        // if (i == N_sym-1) {
-        //     break;
-        // }
-
+        
         const uint32_t c_low = cdf[offset + sym_i];
         const uint32_t c_high = sym_i == max_symbol ? 0x10000U : cdf[offset + sym_i + 1];
 
@@ -418,12 +430,22 @@ torch::Tensor decode_cdf(
 }
 
 
+void saveState(CodecState& state, std::string& filename) {
+    saveStringAsBytes(state.out_cache.out, filename);
+}
+
+CodecState loadState(std::string& filename) {
+    CodecState state;
+    state.in_cache.set(loadStringFromBytes(filename));
+    return state;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<CodecState>(m, "CodecState")
         .def(py::init<>());
     m.def("encode_cdf", &encode_cdf, "Encode from CDF");
     m.def("decode_cdf", &decode_cdf, "Decode from CDF");
-    m.def("serializeState", &serializeState, "Serialize CodecState to string");
-    m.def("deserializeState", &deserializeState, "Deserialize CodecState to string");
+    m.def("loadState", &loadState, "Deserialize CodecState to string");
+    m.def("saveState", &saveState, "Serialize CodecState to string");
     m.def("createEmptyState", &createEmptyState, "Create empty CodecState object");
 }

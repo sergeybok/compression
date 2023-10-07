@@ -1,10 +1,13 @@
 import torch 
 from torch import nn 
+from torch.nn import functional as F
 from typing import Tuple, List, Dict, Optional
 from pydantic import BaseModel
 from nanogpt.model import GPT, GPTConfig
-from compress import ArithmeticCoding
-from torch.nn import functional as F
+from arithmetic_coding_native import FastArithmeticCoding
+from threading import Thread
+import time, random, os
+from utils.utils import TimeIt
 
 
 class GPTParams(BaseModel):
@@ -18,13 +21,24 @@ class GPTParams(BaseModel):
 
 
 
+
+
+
+
 class LMCompressorBase(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, params, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.compressor:ArithmeticCoding = ArithmeticCoding()
-        self.softmax = nn.Softmax(dim=0)
+        self.model = self.init_model(params)
+        self.set_params(params)
+        self.softmax = nn.Softmax(dim=1)
+        self.compressor:FastArithmeticCoding = FastArithmeticCoding()
+        # self.compressors:List[FastArithmeticCoding] = [FastArithmeticCoding()]*params.batch_size
+        self.threads = []
     def set_params(self, params):
         self.train_params = params
+    def wait_for_threads(self):
+        for t in self.threads:
+            t.join()
     def train_step(self, X:torch.tensor, Y:torch.tensor) -> Tuple:
         """
         X: should be [BS, T] long
@@ -34,15 +48,23 @@ class LMCompressorBase(nn.Module):
         raise NotImplementedError('abstract')
     def inference_step(self, X:torch.tensor, Y:torch.tensor):
         raise NotImplementedError('abstract')
+    
     def init_model(self, params=None):
         raise NotImplementedError()
     def get_step_size(self) -> int:
-        return 1
+        return self.train_params.window_size - self.train_params.overlap_size
     def configure_optimizer(self) -> Tuple:
         """
         return optimizer, scheduler
         """
         raise NotImplementedError('abstract')
+    def load_arithmetic_coding_state(self, fn):
+        self.compressor.load_codec_state(fn)
+
+    def decompress_step(self, X):
+        logits, _ = self.train_step(X)
+
+
     def compress_step(self, X, Y) -> Tuple[torch.tensor, torch.tensor]:
         """
         returns loss, masked_loss
@@ -51,18 +73,13 @@ class LMCompressorBase(nn.Module):
         # do compression with logits here
         assert logits.size(0) == 1, f'batchsize should be one but found shape {logits.size()}'
         assert logits.size(1) == X.size(1), f'len should be same as X ({X.size()}) but found shape {logits.size()}'
-        probs = self.softmax(logits[0][-1].view(-1))
-        self.compressor.encode_token(Y[0][-1].item(), probs)
+        probs = F.softmax(logits[0,self.train_params.overlap_size:].double(), dim=1).detach()
+        self.compressor.encode_token(Y[0][-1].item(), probs.view(-1).double().numpy())
         return loss
 
 
 
 class GPTCompressorBase(LMCompressorBase):
-    def __init__(self, params, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.model = self.init_model(params)
-        self.set_params(params)
-        self.softmax = nn.Softmax(dim=1)
     def train_step(self, X:torch.tensor, Y:torch.tensor):
         return self.model(X, Y)
     def configure_optimizer(self) -> Tuple:
@@ -70,24 +87,52 @@ class GPTCompressorBase(LMCompressorBase):
         # TODO figure out scheduler
         scheduler = None
         if self.train_params.use_scheduler:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.train_params.cycle_steps)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.train_params.cycle_steps, eta_min=self.train_params.lr / 50)
         return optimizer, scheduler
-    def get_step_size(self) -> int:
-        return self.train_params.window_size - self.train_params.overlap_size
-    def compress_step(self, X, Y) -> Tuple[torch.tensor, torch.tensor]:
+
+    def decompress_step(self, X, first_step=False, train=False):
+        logits, _ = self.train_step(X, None)
+        masked_logits = logits[:, -1:]
+        probs = F.softmax(masked_logits.detach().double(), dim=-1)
+        tokens = self.compressor.decode_token(probs=probs.cpu(), first_step=first_step)
+        if train:
+            Y = torch.cat(X, tokens, dim=1).contiguous()
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y[:,1:].view(-1), ignore_index=-1)
+        else:
+            loss = None
+        return tokens, loss, probs
+
+    def compress_step(self, X, Y=None, last_step=False) -> Tuple[torch.tensor, torch.tensor]:
         """
         returns loss, masked loss
         """
-        logits, loss = self.train_step(X, Y)
         # do compression with logits here
-        assert logits.size(0) == 1, f'batchsize should be one but found shape {logits.size()}'
+        timer = TimeIt()
+        timer.start('train_step')
+        logits, loss = self.train_step(X, Y)
+        timer.stop()
+        # assert logits.size(0) == 1, f'batchsize should be one but found shape {logits.size()}'
         assert logits.size(1) == X.size(1), f'len should be same as X ({X.size()}) but found shape {logits.size()}'
         masked_logits = logits[:, self.train_params.overlap_size:]
-        probs = self.softmax(masked_logits.view(-1, masked_logits.size(-1)))
-        for i in range(len(probs)):
-            self.compressor.encode_token(Y[0][self.train_params.overlap_size + i].item(), probs[i])
-        masked_loss = F.cross_entropy(masked_logits.view(-1, logits.size(-1)), Y[:,self.train_params.overlap_size:].view(-1), ignore_index=-1)
-        return loss, masked_loss
+        if Y is not None:
+            # TODO Contiguous error here, need to switch to reshape ?
+            # masked_loss = F.cross_entropy(masked_logits.view(-1, masked_logits.size(-1)), Y[:,self.train_params.overlap_size:].view(-1), ignore_index=-1)
+            masked_loss = None
+        else:
+            masked_loss = None
+        probs = F.softmax(masked_logits.detach().double(), dim=-1)
+        self.compressor.encode_token(Y[:,self.train_params.overlap_size:].detach().cpu(), probs=probs.detach().cpu(), last_step=last_step)
+        return loss, loss, probs
+
+
+class GPTCompressModel(GPTCompressorBase):
+    def init_model(self, params=None):
+        params = GPTParams(n_layer=params.n_layers, n_head=params.n_heads, n_embd=64*params.n_heads, block_size=params.window_size, 
+                           bias=False, vocab_size=params.vocab_size, dropout=0)
+        model_args = params.dict()
+        self.gpt_params = model_args
+        gptconf = GPTConfig(**model_args)
+        return GPT(gptconf)
 
 class GPTSmall(GPTCompressorBase):
     def init_model(self, params):
@@ -98,19 +143,121 @@ class GPTSmall(GPTCompressorBase):
         gptconf = GPTConfig(**model_args)
         return GPT(gptconf)
  
+class GPTMedium(GPTCompressorBase):
+    def init_model(self, params):
+        params = GPTParams(n_layer=4, n_head=4, n_embd=256, block_size=params.window_size, 
+                           bias=False, vocab_size=params.vocab_size, dropout=0)
+        model_args = params.dict()
+        self.gpt_params = model_args
+        gptconf = GPTConfig(**model_args)
+        return GPT(gptconf)
+class GPTLarge(GPTCompressorBase):
+    def init_model(self, params):
+        params = GPTParams(n_layer=4, n_head=8, n_embd=512, block_size=params.window_size, 
+                           bias=False, vocab_size=params.vocab_size, dropout=0)
+        model_args = params.dict()
+        self.gpt_params = model_args
+        gptconf = GPTConfig(**model_args)
+        return GPT(gptconf)
+class GPTLarge2L(GPTCompressorBase):
+    def init_model(self, params):
+        params = GPTParams(n_layer=2, n_head=8, n_embd=512, block_size=params.window_size, 
+                           bias=False, vocab_size=params.vocab_size, dropout=0)
+        model_args = params.dict()
+        self.gpt_params = model_args
+        gptconf = GPTConfig(**model_args)
+        return GPT(gptconf)
+class GPTXL(GPTCompressorBase):
+    def init_model(self, params):
+        params = GPTParams(n_layer=8, n_head=8, n_embd=512, block_size=params.window_size, 
+                           bias=False, vocab_size=params.vocab_size, dropout=0)
+        model_args = params.dict()
+        self.gpt_params = model_args
+        gptconf = GPTConfig(**model_args)
+        return GPT(gptconf)
+class GPTReal(GPTCompressorBase):
+    def init_model(self, params):
+        params = GPTParams(block_size=params.window_size, bias=False, vocab_size=params.vocab_size, dropout=0)
+        model_args = params.dict()
+        self.gpt_params = model_args
+        gptconf = GPTConfig(**model_args)
+        return GPT(gptconf)
+class GPT2Pretrained(GPTCompressorBase):
+    def init_model(self, params=None):
+        return GPT.from_pretrained('gpt2')
 
-class LSTMBase(LMCompressorBase): 
+class LSTMBase(LMCompressorBase):
+    def __init__(self, params, *args, **kwargs) -> None:
+        super().__init__(params, *args, **kwargs)
+        self.hidden_state = None 
+        self.reset_hidden_state()
+    def reset_hidden_state(self):
+        model:LSTMModel = self.model
+        self.hidden_state = model.init_hidden(1)
     def configure_optimizer(self):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.train_params.lr, betas=(self.train_params.beta1, self.train_params.beta2))
         scheduler = None
         if self.train_params.use_scheduler:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.train_params.cycle_steps)
         return optimizer, scheduler
+    def detach_hidden_state(self, hidden_state):
+        return (hidden_state[0].detach(), hidden_state[1].detach())
+    def train_step(self, X: torch.tensor, Y: torch.tensor) -> Tuple:
+        logits, hidden = self.model(X, self.hidden_state)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1), ignore_index=-1, reduce=False)
+        self.hidden_state = self.detach_hidden_state(hidden)
+        return  logits, loss
+    def compress_step(self, X, Y) -> Tuple:
+        logits, loss = self.train_step(X, Y)
+        masked_loss = loss[self.train_params.overlap_size:].mean()
+        loss = loss.mean()
+        probs = F.softmax(logits[0,self.train_params.overlap_size:].double(), dim=1).detach()
+        self.compressor.encode_token(Y[0][self.train_params.overlap_size:].numpy().tolist(), probs.view(-1, logits.size(-1)).double().numpy())
+        # for i in range(len(probs)):
+        #     self.compressor.encode_token(Y[0][self.train_params.overlap_size + i].item(), probs[i].view(-1).double().numpy())
+        return loss, masked_loss
 
-    def get_step_size(self) -> int:
-        return self.train_params.window_size
 
-   
+class RNNBase(LSTMBase):
+    def detach_hidden_state(self, hidden_state):
+        return hidden_state.detach()
+class RNNBig(RNNBase):
+    def init_model(self, params=None):
+        return RNNLanguageModel(params.vocab_size, 128, hidden_size=512, num_layers=1, use_ortho=True)
+
+class RNNMedium(RNNBase):
+    def init_model(self, params=None):
+        return RNNLanguageModel(params.vocab_size, 128, hidden_size=256, num_layers=1, use_ortho=True)
+
+class LSTMBig(LSTMBase):
+    def init_model(self, params):
+        model = LSTMModelBeefy(params.vocab_size, embedding_dim=128, hidden_dim=512, n_layers=1, xavier_init=True, embedding_path=None, input_bias=True)
+        return model
+
+class LSTMMedium(LSTMBase):
+    def init_model(self, params):
+        model = LSTMModelBeefy(params.vocab_size, embedding_dim=128, hidden_dim=256, n_layers=1, xavier_init=True, embedding_path=None, input_bias=True)
+        return model
+
+class RNNLanguageModel(nn.Module):
+    def __init__(self, vocab_size, embed_size, hidden_size, num_layers, use_ortho:bool=True):
+        super(RNNLanguageModel, self).__init__()
+        self.embed = nn.Embedding(vocab_size, embed_size)
+        self.rnn = nn.RNN(embed_size, hidden_size, num_layers, batch_first=True)
+        self.linear = nn.Linear(hidden_size, vocab_size)
+        if use_ortho:
+            for name, param in self.rnn.named_parameters():
+                if 'weight_ih' in name or 'weight_hh' in name:
+                    nn.init.orthogonal_(param)
+    def forward(self, x, h):
+        x = self.embed(x)
+        x, h = self.rnn(x, h)
+        x = self.linear(x)
+        return x, h
+    
+    def init_hidden(self, batch_size):
+        return torch.zeros(self.rnn.num_layers, batch_size, self.rnn.hidden_size)
+
 
 # Model definition
 class LSTMModel(nn.Module):
@@ -263,4 +410,19 @@ class MegaLSTM(nn.Module):
         return
 
 
+
+
+
+
+def load_gpt_model(model:GPTCompressModel, ckpt_path:str, device):
+    if ckpt_path:
+        print(f"Resuming training from {ckpt_path}")
+        ckpt_path = os.path.join(ckpt_path)
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        state_dict = checkpoint['model']
+        unwanted_prefix = '_orig_mod.'
+        for k,v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        model.model.load_state_dict(state_dict)
 
