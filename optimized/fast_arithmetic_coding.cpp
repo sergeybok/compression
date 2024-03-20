@@ -430,11 +430,11 @@ torch::Tensor decode_cdf(
 }
 
 
-void saveState(CodecState& state, std::string& filename) {
+void save_state(CodecState& state, std::string& filename) {
     saveStringAsBytes(state.out_cache.out, filename);
 }
 
-CodecState loadState(std::string& filename) {
+CodecState load_state(std::string& filename) {
     CodecState state;
     state.in_cache.set(loadStringFromBytes(filename));
     return state;
@@ -445,7 +445,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(py::init<>());
     m.def("encode_cdf", &encode_cdf, "Encode from CDF");
     m.def("decode_cdf", &decode_cdf, "Decode from CDF");
-    m.def("loadState", &loadState, "Deserialize CodecState to string");
-    m.def("saveState", &saveState, "Serialize CodecState to string");
+    m.def("load_state", &load_state, "Deserialize CodecState to string");
+    m.def("save_state", &save_state, "Serialize CodecState to string");
     m.def("createEmptyState", &createEmptyState, "Create empty CodecState object");
 }

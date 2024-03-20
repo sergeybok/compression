@@ -1,11 +1,11 @@
 import torch
 from tqdm.auto import tqdm 
-from arithmetic_coding import ArithmeticCoding
+from arithmetic_coding_native import FastArithmeticCoding
 # from compress import ArithmeticCoding
 
 
-FN = 'data/shakespeare/input.txt'
-# FN = 'data/tokyo-article/input.txt'
+# FN = 'data/shakespeare/input.txt'
+FN = 'data/tokyo-article/input.txt'
 
 
 with open(FN, 'r') as f:
@@ -39,25 +39,26 @@ def print_sorted():
 
 print_sorted()
 
+probs = probs.unsqueeze(0)
 
-compressor = ArithmeticCoding(probs.double().numpy())
+compressor = FastArithmeticCoding()
 i = 0
 for c in tqdm(txt):
     idx = alpha_to_index[c]
     if i == 432:
         x = 1
-    compressor.encode_token(idx)
+    idx = torch.tensor([idx])
     i += 1
+    compressor.encode_token(idx, probs, last=i==len(txt))
     pass
 
-compressor.cache_buffer('debug.bin')
-compressor.clear_buffer()
-
-compressor.load_buffer('debug.bin')
+compressor.save_state('debug.bin')
+compressor.reset_state()
+compressor.load_state('debug.bin')
 
 out_str = ''
 for i in tqdm(range(len(txt))):
-    idx = compressor.decode_token()
+    idx = compressor.decode_token(probs, first_step=i==0)
     out_str += alphabet[idx]
     pass
 
