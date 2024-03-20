@@ -52,9 +52,9 @@ for c in tqdm(txt):
     compressor.encode_token(idx, probs, last=i==len(txt))
     pass
 
-compressor.save_state('debug.bin')
+compressor.save_state('debug/debug.bin')
 compressor.reset_state()
-compressor.load_state('debug.bin')
+compressor.load_state('debug/debug.bin')
 
 out_str = ''
 for i in tqdm(range(len(txt))):
@@ -62,7 +62,7 @@ for i in tqdm(range(len(txt))):
     out_str += alphabet[idx]
     pass
 
-with open('debug.txt', 'w') as f:
+with open('debug/debug.txt', 'w') as f:
     f.write(out_str)
 
 
